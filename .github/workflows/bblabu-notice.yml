@@ -1,0 +1,176 @@
+# bblabu 公告云端接管
+# 落位：仓库 .github/workflows/bblabu-notice.yml
+#
+# 设计（双端接替，靠心跳 + 共享已见 hash，不靠开关）：
+#   · 本机（额度管家 bblabu-notice-watch.ps1）开机时轮询并发信，每 5 分钟把 heartbeatAt 推到远端 state.json；
+#   · 本作业只在「心跳过期」时才接管：拉公告 → 比内容 sha256 → 变了才发信 → 把 lastHash/lastSentAt 写回。
+#
+# ★ 状态写回不走 git（v3 关键改动）：
+#   本机每 40–60 秒就推一次心跳，走 git 的话云端 commit 必然被顶掉；而 state.json 原先是单行 JSON，
+#   两边各改一个字段 rebase 必冲突（云管家 2026-11-13 实测复现）。所以改成 GitHub Contents API
+#   PUT + sha 乐观锁：每次都重读远端最新版本，只覆盖 lastHash/lastSentAt 两个键，本机写的 heartbeatAt 原样保留。
+#   代价：本作业不需要 checkout，也不产生 git 历史噪音。
+#
+# 字段归属（硬契约）：
+#   · 本机只写 heartbeatAt；云端只写 lastHash / lastSentAt
+#   · 双方都必须先读远端最新版本再写，禁止整文件覆盖
+#
+# 关于 api.bblabu.cn 的解析（2026-11-13 云管家实测）：
+#   权威 NS 是 Cloudflare，公网 DNS 直接返回 CF 边缘 104.26.12.219，橙云代理；裸 DNS 即可 200。
+#   所以**不做无条件钉 hosts**，只在裸 DNS 取数失败时才回落钉 IP —— 硬钉的坏处是 CF 换边缘 IP 后作业会挂着失败。
+
+name: bblabu-notice
+
+on:
+  # ⚠️ 唯一的开关：改下面这一行就能换间隔（其它地方都不用动）
+  #   公开仓（标准 runner 免费且不计量，2026-11-13 用户已授权公开）：*/15 甚至更密都不花额度。
+  #   关机后可被接管的延迟 ≈ FRESH(10 分钟) + 一个 cron 周期；GitHub 免费调度器还会额外抖动、
+  #   整点更挤、极端时丢一次排队任务且不补跑，所以只能承诺「大致 N 分钟内」，不是准点。
+  #   ⚠️ 公开仓的 Actions 日志对外可见：本作业已确保不打印公告正文、收件邮箱、任何凭据。
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write          # Contents API 写 state.json 需要
+
+concurrency:
+  group: bblabu-notice
+  cancel-in-progress: false
+
+jobs:
+  take-over:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASS: ${{ secrets.SMTP_PASS }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # 首跑靠这一步判定 runner 侧的真实网络情况（不参与后续判定，失败也不中断）
+      - name: 诊断 runner 侧解析与连通性
+        continue-on-error: true
+        run: |
+          echo "DNS: $(getent hosts api.bblabu.cn || echo 'no result')"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://api.bblabu.cn/api/notice 2>/dev/null || echo failed)
+          echo "unpinned -> HTTP ${code}"
+          echo "（预期 DNS 为 CF 边缘 104.26.x，unpinned 200 属正常，不是异常）"
+
+      - name: 心跳判定 → 轮询 → 发信 → 写回
+        run: |
+          python3 - <<'PY'
+          import base64, datetime, hashlib, json, os, smtplib, subprocess, sys, time
+          import urllib.error, urllib.request
+          from email.message import EmailMessage
+
+          URL    = "https://api.bblabu.cn/api/notice"
+          FRESH  = 600                     # 本机心跳 10 分钟内 = PC 在线，云端不接管
+          SMTP_HOST, SMTP_PORT = "smtp.qq.com", 465
+          BRANCH, PATH  = "main", "state.json"
+          TOKEN = os.environ.get("GITHUB_TOKEN", "")
+          REPO  = os.environ.get("GITHUB_REPOSITORY", "")
+          API   = "https://api.github.com/repos/%s/contents/%s" % (REPO, PATH)
+          HDR   = {"Authorization": "Bearer " + TOKEN,
+                   "Accept": "application/vnd.github+json",
+                   "User-Agent": "bblabu-notice/1.0"}
+          PIN = "api.bblabu.cn"
+
+          if not TOKEN or not REPO:
+              sys.exit("缺 GITHUB_TOKEN / GITHUB_REPOSITORY")
+
+          def get_state():
+              req = urllib.request.Request(API + "?ref=" + BRANCH, headers=HDR)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  d = json.load(r)
+              raw = base64.b64decode(d.get("content", "")).decode("utf-8")
+              try:
+                  return json.loads(raw or "{}"), d["sha"]
+              except Exception:
+                  return {}, d["sha"]
+
+          def put_state(updates):
+              """只覆盖 updates 里的键，其余键（如本机写的 heartbeatAt）原样保留。
+                 用 sha 乐观锁：本机随时可能推心跳，冲突就重读重试。"""
+              for attempt in range(1, 6):
+                  cur, sha = get_state()
+                  cur.update({k: v for k, v in updates.items()
+                              if k in ("lastHash", "lastSentAt")})
+                  payload = json.dumps({
+                      "message": "state: lastHash=%s" % str(cur.get("lastHash", ""))[:12],
+                      "content": base64.b64encode(
+                          json.dumps(cur, ensure_ascii=False, indent=2).encode("utf-8")
+                      ).decode("ascii"),
+                      "sha": sha,
+                      "branch": BRANCH,
+                  }).encode("utf-8")
+                  req = urllib.request.Request(API, data=payload, method="PUT", headers=HDR)
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          print("state.json 已写回（第 %d 次尝试）" % attempt)
+                          return True
+                  except urllib.error.HTTPError as e:
+                      print("写回被拒 HTTP %s（第 %d 次），重读后重试" % (e.code, attempt))
+                      time.sleep(3)
+              print("::warning::state.json 写回连续失败，lastHash 未落盘，下一轮可能重发同一封公告")
+              return False
+
+          def ts(v):
+              try:
+                  return datetime.datetime.fromisoformat(v)
+              except Exception:
+                  return None
+
+          state, _ = get_state()
+          now = datetime.datetime.now(datetime.timezone.utc)
+
+          hb = ts(state.get("heartbeatAt") or "")
+          if hb is not None and (now - hb).total_seconds() < FRESH:
+              print("PC 在线（心跳新鲜）→ 云端不接管")
+              sys.exit(0)
+          print("PC 心跳过期或缺失 → 云端接管")
+
+          def get():
+              req = urllib.request.Request(URL, headers={"User-Agent": "bblabu-notice/1.0"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return r.read().decode("utf-8", "replace")
+
+          try:
+              raw = get()
+          except Exception as e:
+              print("裸 DNS 取数失败(%s) → 回落钉 CF 边缘 IP 重试" % type(e).__name__)
+              subprocess.run(["sudo", "sh", "-c",
+                              'grep -q "%s" /etc/hosts || echo "104.26.12.219 %s" >> /etc/hosts'
+                              % (PIN, PIN)], check=False)
+              raw = get()
+
+          print("HTTP 200，%d 字节" % len(raw))
+          try:
+              text = json.loads(raw).get("data") or ""
+          except Exception:
+              text = raw
+
+          h = hashlib.sha256(text.encode("utf-8")).hexdigest()
+          if h == state.get("lastHash"):
+              print("公告未变，不发信")
+              sys.exit(0)
+
+          to   = os.environ.get("NOTIFY_TO", "").strip()
+          user = os.environ.get("SMTP_USER", "").strip()
+          pwd  = os.environ.get("SMTP_PASS", "")
+          if not (to and user and pwd):
+              sys.exit("缺 NOTIFY_TO / SMTP_USER / SMTP_PASS")
+
+          msg = EmailMessage()
+          msg["From"] = user
+          msg["To"] = to
+          msg["Subject"] = "bblabu 公告有更新"
+          msg.set_content("bblabu 后台公告发生变化：\n\n" + text + "\n\n-- 来自 GitHub Actions 云端接管")
+
+          with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+              s.login(user, pwd)
+              s.send_message(msg)
+          print("已发信（正文与凭据都不进日志）")
+
+          put_state({"lastHash": h, "lastSentAt": now.isoformat()})
+          PY
